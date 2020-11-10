@@ -974,9 +974,10 @@ static int read_proc_receive_report(struct packet_reader *reader,
 	struct command *cmd;
 	struct command *hint = NULL;
 	struct ref_push_report *report = NULL;
-	int new_report = 0;
 	int code = 0;
+	int new_report = 0;
 	int once = 0;
+	int response = 0;
 
 	for (;;) {
 		struct object_id old_oid, new_oid;
@@ -984,8 +985,14 @@ static int read_proc_receive_report(struct packet_reader *reader,
 		const char *refname;
 		char *p;
 
-		if (packet_reader_read(reader) != PACKET_READ_NORMAL)
+		if (packet_reader_read(reader) != PACKET_READ_NORMAL) {
+			if (!response) {
+				strbuf_addstr(errmsg, "no response from proc-receive hook");
+				return -1;
+			}
 			break;
+		}
+		response++;
 
 		head = reader->line;
 		p = strchr(head, ' ');
@@ -1100,7 +1107,7 @@ static int run_proc_receive_hook(struct command *commands,
 	struct strbuf cap = STRBUF_INIT;
 	struct strbuf errmsg = STRBUF_INIT;
 	int hook_use_push_options = 0;
-	int version = 0;
+	int version = -1;
 	int code;
 
 	argv[0] = find_hook("proc-receive");
@@ -1145,12 +1152,17 @@ static int run_proc_receive_hook(struct command *commands,
 	if (use_push_options)
 		strbuf_addstr(&cap, " push-options");
 	if (cap.len) {
-		packet_write_fmt(proc.in, "version=1%c%s\n", '\0', cap.buf + 1);
+		code = packet_write_fmt_gently(proc.in, "version=1%c%s\n", '\0', cap.buf + 1);
 		strbuf_release(&cap);
 	} else {
-		packet_write_fmt(proc.in, "version=1\n");
+		code = packet_write_fmt_gently(proc.in, "version=1\n");
 	}
-	packet_flush(proc.in);
+	if (!code)
+		code = packet_flush_gently(proc.in);
+	if (code) {
+		strbuf_addstr(&errmsg, "fail to negotiate version with proc-receive hook");
+		goto cleanup;
+	}
 
 	for (;;) {
 		int linelen;
@@ -1169,7 +1181,11 @@ static int run_proc_receive_hook(struct command *commands,
 		}
 	}
 
-	if (version != 1) {
+	if (version == -1) {
+		strbuf_addstr(&errmsg, "fail to negotiate version with proc-receive hook");
+		code = -1;
+		goto cleanup;
+	} else if (version != 1) {
 		strbuf_addf(&errmsg, "proc-receive version '%d' is not supported",
 			    version);
 		code = -1;
@@ -1180,20 +1196,36 @@ static int run_proc_receive_hook(struct command *commands,
 	for (cmd = commands; cmd; cmd = cmd->next) {
 		if (!cmd->run_proc_receive || cmd->skip_update || cmd->error_string)
 			continue;
-		packet_write_fmt(proc.in, "%s %s %s",
-				 oid_to_hex(&cmd->old_oid),
-				 oid_to_hex(&cmd->new_oid),
-				 cmd->ref_name);
+		code = packet_write_fmt_gently(proc.in, "%s %s %s",
+					       oid_to_hex(&cmd->old_oid),
+					       oid_to_hex(&cmd->new_oid),
+					       cmd->ref_name);
+		if (code)
+			break;
 	}
-	packet_flush(proc.in);
+	if (!code)
+		code = packet_flush_gently(proc.in);
+	if (code) {
+		strbuf_addstr(&errmsg, "fail to write commands to proc-receive hook");
+		goto cleanup;
+	}
 
 	/* Send push options */
 	if (hook_use_push_options) {
 		struct string_list_item *item;
 
-		for_each_string_list_item(item, push_options)
-			packet_write_fmt(proc.in, "%s", item->string);
-		packet_flush(proc.in);
+		for_each_string_list_item(item, push_options) {
+			code = packet_write_fmt_gently(proc.in, "%s", item->string);
+			if (code)
+				break;
+		}
+		if (!code)
+			code = packet_flush_gently(proc.in);
+		if (code) {
+			strbuf_addstr(&errmsg,
+				      "fail to write push-options to proc-receive hook");
+			goto cleanup;
+		}
 	}
 
 	/* Read result from proc-receive */
